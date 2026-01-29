@@ -5,59 +5,92 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class MasterHandler implements Runnable {
 
-    // File → list of chunk IDs
+    // METADATA
     private static final Map<String, List<String>> fileToChunks = new HashMap<>();
-
-    // Chunk ID → list of chunkserver addresses
     private static final Map<String, List<String>> chunkToServers = new HashMap<>();
-
-    // Registered chunkservers (host:port)
     private static final List<String> chunkServers = new ArrayList<>();
+    private static final Map<String, Long> lastHeartbeat = new HashMap<>();
 
-    // Metadata lock
     private static final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    // Chunk ID counter
+    private static final int REPLICATION_FACTOR = 3;
     private static int chunkCounter = 0;
 
     private final Socket socket;
+
+    // FAILURE MONITOR
+    static {
+        new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(5000);
+                    long now = System.currentTimeMillis();
+
+                    lock.writeLock().lock();
+                    Iterator<String> it = lastHeartbeat.keySet().iterator();
+
+                    while (it.hasNext()) {
+                        String server = it.next();
+                        long last = lastHeartbeat.get(server);
+
+                        if (now - last > 10000) {
+                            System.out.println("ChunkServer FAILED: " + server);
+                            it.remove();
+                            chunkServers.remove(server);
+
+                            for (List<String> replicas : chunkToServers.values()) {
+                                replicas.remove(server);
+                            }
+                        }
+                    }
+                    lock.writeLock().unlock();
+
+                } catch (Exception ignored) {}
+            }
+        }).start();
+    }
 
     public MasterHandler(Socket socket) {
         this.socket = socket;
     }
 
+    // MAIN HANDLER
     @Override
     public void run() {
         try {
-            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+            // 🔥 INPUT FIRST (prevents stream header deadlock)
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
-
             Message request = (Message) in.readObject();
-            System.out.println("Received: " + request.type);
+
+            // ========= ONE-WAY CONTROL MESSAGES =========
+            if (request.type == RequestType.HEARTBEAT) {
+                handleHeartbeat(request);
+                socket.close();
+                return;
+            }
+
+            if (request.type == RequestType.REGISTER_CHUNKSERVER) {
+                handleRegisterChunkServer(request);
+                socket.close();
+                return;
+            }
+
+            // ========= REQUEST–RESPONSE RPC =========
+            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+            out.flush();
 
             switch (request.type) {
 
-                case CREATE_FILE:
-                    handleCreateFile(request, out);
-                    break;
+                case CREATE_FILE -> handleCreateFile(request, out);
+                case GET_CHUNKS -> handleGetChunks(request, out);
+                case APPEND -> handleAppend(request, out);
 
-                case GET_CHUNKS:
-                    handleGetChunks(request, out);
-                    break;
-
-                case REGISTER_CHUNKSERVER:
-                    handleRegisterChunkServer(request, out);
-                    break;
-
-                default:
+                default -> {
                     Message error = new Message();
                     error.type = request.type;
-                    error.fileName = request.fileName;
-                    error.chunkList = null;
-                    error.chunkServerList = null;
-
                     out.writeObject(error);
                     out.flush();
+                }
             }
 
             socket.close();
@@ -67,107 +100,114 @@ public class MasterHandler implements Runnable {
         }
     }
 
-    //CREATE FILE
-    private void handleCreateFile(Message request, ObjectOutputStream out)
-            throws IOException {
-
+    // CREATE FILE
+    private void handleCreateFile(Message req, ObjectOutputStream out) throws IOException {
         lock.writeLock().lock();
         try {
-            Message response = new Message();
-            response.type = RequestType.CREATE_FILE;
-            response.fileName = request.fileName;
+            Message res = new Message();
+            res.type = RequestType.CREATE_FILE;
+            res.fileName = req.fileName;
 
-            // File already exists OR no chunkservers available
-            if (fileToChunks.containsKey(request.fileName) || chunkServers.isEmpty()) {
-                response.chunkList = null;
-                response.chunkServerList = null;
+            if (fileToChunks.containsKey(req.fileName) || chunkServers.isEmpty()) {
+                res.chunkList = null;
+                res.chunkServerList = null;
             } else {
                 String chunkId = generateChunkId();
                 allocateChunk(chunkId);
 
-                List<String> chunks = new ArrayList<>();
-                chunks.add(chunkId);
-                fileToChunks.put(request.fileName, chunks);
-
-                response.chunkList = chunks;
-                response.chunkServerList = chunkToServers.get(chunkId);
+                fileToChunks.put(req.fileName, List.of(chunkId));
+                res.chunkList = List.of(chunkId);
+                res.chunkServerList = chunkToServers.get(chunkId);
             }
 
-            out.writeObject(response);
+            out.writeObject(res);
             out.flush();
-
         } finally {
             lock.writeLock().unlock();
         }
     }
 
-    //GET CHUNKS
-    private void handleGetChunks(Message request, ObjectOutputStream out)
-            throws IOException {
-
+    // GET CHUNKS
+    private void handleGetChunks(Message req, ObjectOutputStream out) throws IOException {
         lock.readLock().lock();
         try {
-            Message response = new Message();
-            response.type = RequestType.GET_CHUNKS;
-            response.fileName = request.fileName;
-            response.chunkList = fileToChunks.get(request.fileName);
+            Message res = new Message();
+            res.type = RequestType.GET_CHUNKS;
+            res.fileName = req.fileName;
+            res.chunkList = fileToChunks.get(req.fileName);
 
-            if (response.chunkList != null && !response.chunkList.isEmpty()) {
-                response.chunkServerList =
-                        chunkToServers.get(response.chunkList.get(0));
-            } else {
-                response.chunkServerList = null;
+            if (res.chunkList != null && !res.chunkList.isEmpty()) {
+                res.chunkServerList = chunkToServers.get(res.chunkList.get(0));
             }
 
-            out.writeObject(response);
+            out.writeObject(res);
             out.flush();
-
         } finally {
             lock.readLock().unlock();
         }
     }
 
-    //REGISTER CHUNKSERVER
-    private void handleRegisterChunkServer(Message request, ObjectOutputStream out)
-            throws IOException {
-
+    // REGISTER CHUNKSERVER (ONE-WAY)
+    private void handleRegisterChunkServer(Message req) {
         lock.writeLock().lock();
         try {
-            if (request.chunkServerList != null && !request.chunkServerList.isEmpty()) {
-                String server = request.chunkServerList.get(0);
-                if (!chunkServers.contains(server)) {
-                    chunkServers.add(server);
-                    System.out.println("Registered ChunkServer: " + server);
-                }
+            String server = req.chunkServerList.get(0);
+
+            if (!chunkServers.contains(server)) {
+                chunkServers.add(server);
+                lastHeartbeat.put(server, System.currentTimeMillis());
+                System.out.println("Registered ChunkServer: " + server);
             }
-
-            Message response = new Message();
-            response.type = RequestType.REGISTER_CHUNKSERVER;
-
-            out.writeObject(response);
-            out.flush();
-
         } finally {
             lock.writeLock().unlock();
         }
     }
 
-    //CHUNK ALLOCATION
+    // HEARTBEAT (ONE-WAY)
+    private void handleHeartbeat(Message req) {
+        lock.writeLock().lock();
+        try {
+            lastHeartbeat.put(req.chunkServerList.get(0), System.currentTimeMillis());
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    // APPEND
+    private void handleAppend(Message req, ObjectOutputStream out) throws IOException {
+        lock.writeLock().lock();
+        try {
+            List<String> chunks = fileToChunks.get(req.fileName);
+
+            Message res = new Message();
+            res.type = RequestType.APPEND;
+
+            if (chunks != null && !chunks.isEmpty()) {
+                String lastChunk = chunks.get(chunks.size() - 1);
+                res.chunkList = List.of(lastChunk);
+                res.chunkServerList = chunkToServers.get(lastChunk);
+            }
+
+            out.writeObject(res);
+            out.flush();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    // CHUNK ALLOCATION
     private void allocateChunk(String chunkId) {
         List<String> replicas = new ArrayList<>();
+        int n = Math.min(REPLICATION_FACTOR, chunkServers.size());
 
-        if (chunkServers.size() == 1) {
-            replicas.add(chunkServers.get(0));
-        } else {
-            replicas.add(chunkServers.get(chunkCounter % chunkServers.size()));
-            replicas.add(chunkServers.get((chunkCounter + 1) % chunkServers.size()));
+        for (int i = 0; i < n; i++) {
+            replicas.add(chunkServers.get((chunkCounter + i) % chunkServers.size()));
         }
 
         chunkToServers.put(chunkId, replicas);
     }
 
-
-    //CHUNK ID GENERATOR
+    // CHUNK ID GENERATOR
     private static synchronized String generateChunkId() {
         return "chunk_" + (++chunkCounter);
     }
