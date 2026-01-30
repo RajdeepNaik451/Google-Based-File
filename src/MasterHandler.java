@@ -18,6 +18,12 @@ public class MasterHandler implements Runnable {
 
     private final Socket socket;
 
+    private static final int CHUNK_SIZE = 64 * 1024; // 64 KB
+
+    private static final Map<String, Long> fileSizes = new HashMap<>();
+    private static final Map<String, String> fileTypes = new HashMap<>();
+    private static final Set<String> directories = new HashSet<>();
+
     // FAILURE MONITOR
     static {
         new Thread(() -> {
@@ -84,6 +90,12 @@ public class MasterHandler implements Runnable {
                 case CREATE_FILE -> handleCreateFile(request, out);
                 case GET_CHUNKS -> handleGetChunks(request, out);
                 case APPEND -> handleAppend(request, out);
+                case CREATE_DIRECTORY -> {
+                    handleCreateDirectory(request);
+                    socket.close();
+                    return;
+                }
+
 
                 default -> {
                     Message error = new Message();
@@ -101,27 +113,51 @@ public class MasterHandler implements Runnable {
     }
 
     // CREATE FILE
-    private void handleCreateFile(Message req, ObjectOutputStream out) throws IOException {
+    private void handleCreateFile(Message req, ObjectOutputStream out)
+            throws IOException {
+
         lock.writeLock().lock();
         try {
             Message res = new Message();
             res.type = RequestType.CREATE_FILE;
             res.fileName = req.fileName;
 
-            if (fileToChunks.containsKey(req.fileName) || chunkServers.isEmpty()) {
+            if (fileToChunks.containsKey(req.fileName)) {
                 res.chunkList = null;
-                res.chunkServerList = null;
             } else {
-                String chunkId = generateChunkId();
-                allocateChunk(chunkId);
 
-                fileToChunks.put(req.fileName, List.of(chunkId));
-                res.chunkList = List.of(chunkId);
-                res.chunkServerList = chunkToServers.get(chunkId);
+                int chunkCount =
+                        (int) Math.ceil((double) req.fileSize / CHUNK_SIZE);
+
+                List<String> chunks = new ArrayList<>();
+
+                for (int i = 0; i < chunkCount; i++) {
+                    String chunkId = generateChunkId();
+                    allocateChunk(chunkId);
+                    chunks.add(chunkId);
+                }
+
+                fileToChunks.put(req.fileName, chunks);
+                fileSizes.put(req.fileName, req.fileSize);
+                fileTypes.put(req.fileName, req.fileType);
+
+                res.chunkList = chunks;
             }
 
             out.writeObject(res);
             out.flush();
+
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+    // CREATE DIRECTORY
+    private void handleCreateDirectory(Message req) {
+
+        lock.writeLock().lock();
+        try {
+            directories.add(req.fileName);
+            System.out.println("Directory created: " + req.fileName);
         } finally {
             lock.writeLock().unlock();
         }
