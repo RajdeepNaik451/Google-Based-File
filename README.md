@@ -14,32 +14,38 @@ This project demonstrates core distributed-systems ideas such as:
 ## Architecture Overview
 
 ```
-                +-------------------+
-                |      Client       |
-                |-------------------|
-                | CREATE / READ /   |
-                | WRITE requests    |
-                +---------+---------+
-                          |
-                          v
-                +-------------------+
-                |       Master      |
-                |-------------------|
-                | Metadata          |
-                |  - file → chunks  |
-                |  - chunk → servers|
-                | Registration      |
-                +---------+---------+
-                          |
-          ---------------------------------------
-          |                                     |
-          v                                     v
-+-------------------+               +-------------------+
-|   ChunkServer 1   |               |   ChunkServer 2   |
-|-------------------|               |-------------------|
-| Stores chunk data |               | Stores chunk data |
-| Handles read/write|               | Handles read/write|
-+-------------------+               +-------------------+
+                    +----------------------+
+                    |        Client        |
+                    |----------------------|
+                    | - Upload / Download  |
+                    | - File Chunking      |
+                    | - Replica-aware IO   |
+                    +----------+-----------+
+                               |
+              Metadata RPC      |   (CREATE_FILE, GET_CHUNKS, APPEND)
+                               |
+                    +----------v-----------+
+                    |        Master        |
+                    |----------------------|
+                    | - File metadata      |
+                    | - Chunk metadata     |
+                    | - Chunk placement    |
+                    | - Heartbeats         |
+                    | - Failure detection  |
+                    +----------+-----------+
+                               |
+            Heartbeat / Register|
+                               |
+        +-----------+-----------+-----------+
+        |           |                       |
++-------v------+ +---v---------+   +--------v------+
+| ChunkServer  | | ChunkServer  |   | ChunkServer   |
+|  (6001)      | |   (6002)     |   |   (6003)      |
+|--------------| |--------------|   |---------------|
+| Store chunks | | Store chunks |   | Store chunks  |
+| Read/Write   | | Read/Write   |   | Read/Write    |
++--------------+ +--------------+   +---------------+
+
 ```
 
 ---
